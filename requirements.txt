@@ -1,0 +1,7 @@
+deepgram-sdk==5.3.2
+groq==1.0.0
+pynput==1.8.1
+sounddevice==0.5.5
+numpy==2.4.2
+soundfile==0.13.1
+python-dotenv==1.2.1

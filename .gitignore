@@ -1,0 +1,8 @@
+.env
+keys.enc
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+*.exe
