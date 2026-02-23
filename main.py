@@ -1,27 +1,28 @@
 """
-Custom Flow — Voice dictation for Windows 11
+Custom Flow — Voice dictation for Windows and macOS
 
-Hold the hotkey (default: Right Alt) → speak → release → cleaned text
-is injected into whatever text box is currently focused.
+Hold the hotkey (default: Right Alt / Right Option) → speak → release →
+cleaned text is injected into whatever text box is currently focused.
 
 Setup:
     1. Copy .env.example to .env and add your API keys
-    2. Double-click CustomFlow.exe  (or run: python main.py)
+    2. Run: python main.py          (or double-click CustomFlow.exe on Windows)
     3. Right-click the pill overlay to add to startup or quit
 
 CLI flags:
-    python main.py --install      # Add to Windows startup
-    python main.py --uninstall    # Remove from Windows startup
+    python main.py --install      # Add to startup (Windows & macOS)
+    python main.py --uninstall    # Remove from startup
 """
 
 import argparse
+import base64
 import ctypes
-import ctypes.wintypes
 import io
 import json
 import logging
 import math
 import os
+import plistlib
 import queue
 import re
 import shutil
@@ -31,6 +32,13 @@ import threading
 import time
 import tkinter as tk
 import tkinter.messagebox as tk_msg
+
+# ── Platform detection ───────────────────────────────────────────────────────────
+_IS_WIN = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
+
+if _IS_WIN:
+    import ctypes.wintypes
 
 import numpy as np
 import sounddevice as sd
@@ -42,81 +50,104 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KbController, Key as KbKey
 
 
-# ── Windows DPAPI Encryption ────────────────────────────────────────────────────
+# ── Windows DPAPI Encryption (Windows-only) ─────────────────────────────────────
 # Uses CryptProtectData/CryptUnprotectData — tied to the current Windows user.
-# Even another admin on the same machine cannot decrypt without user credentials.
+# On macOS/Linux the keys live only in .env (no OS-level encryption needed).
 
-class _DPAPI:
-    """Zero-dependency Windows Data Protection API wrapper."""
+if _IS_WIN:
+    class _DPAPI:
+        """Zero-dependency Windows Data Protection API wrapper."""
 
-    class _BLOB(ctypes.Structure):
-        _fields_ = [
-            ("cbData", ctypes.wintypes.DWORD),
-            ("pbData", ctypes.POINTER(ctypes.c_byte)),
-        ]
+        class _BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
 
-    _protect = ctypes.windll.crypt32.CryptProtectData
-    _unprotect = ctypes.windll.crypt32.CryptUnprotectData
-    _local_free = ctypes.windll.kernel32.LocalFree
+        _protect = ctypes.windll.crypt32.CryptProtectData
+        _unprotect = ctypes.windll.crypt32.CryptUnprotectData
+        _local_free = ctypes.windll.kernel32.LocalFree
 
-    @classmethod
-    def encrypt(cls, data: bytes) -> bytes:
-        blob_in = cls._BLOB(len(data), (ctypes.c_byte * len(data))(*data))
-        blob_out = cls._BLOB()
-        if not cls._protect(
-            ctypes.byref(blob_in), None, None, None, None, 0,
-            ctypes.byref(blob_out),
-        ):
-            raise OSError("DPAPI CryptProtectData failed")
-        ptr = ctypes.cast(blob_out.pbData, ctypes.c_void_p)
-        result = ctypes.string_at(ptr, blob_out.cbData)
-        cls._local_free(blob_out.pbData)
-        return result
+        @classmethod
+        def encrypt(cls, data: bytes) -> bytes:
+            blob_in = cls._BLOB(len(data), (ctypes.c_byte * len(data))(*data))
+            blob_out = cls._BLOB()
+            if not cls._protect(
+                ctypes.byref(blob_in), None, None, None, None, 0,
+                ctypes.byref(blob_out),
+            ):
+                raise OSError("DPAPI CryptProtectData failed")
+            ptr = ctypes.cast(blob_out.pbData, ctypes.c_void_p)
+            result = ctypes.string_at(ptr, blob_out.cbData)
+            cls._local_free(blob_out.pbData)
+            return result
 
-    @classmethod
-    def decrypt(cls, data: bytes) -> bytes:
-        blob_in = cls._BLOB(len(data), (ctypes.c_byte * len(data))(*data))
-        blob_out = cls._BLOB()
-        if not cls._unprotect(
-            ctypes.byref(blob_in), None, None, None, None, 0,
-            ctypes.byref(blob_out),
-        ):
-            raise OSError("DPAPI CryptUnprotectData failed")
-        ptr = ctypes.cast(blob_out.pbData, ctypes.c_void_p)
-        result = ctypes.string_at(ptr, blob_out.cbData)
-        cls._local_free(blob_out.pbData)
-        return result
+        @classmethod
+        def decrypt(cls, data: bytes) -> bytes:
+            blob_in = cls._BLOB(len(data), (ctypes.c_byte * len(data))(*data))
+            blob_out = cls._BLOB()
+            if not cls._unprotect(
+                ctypes.byref(blob_in), None, None, None, None, 0,
+                ctypes.byref(blob_out),
+            ):
+                raise OSError("DPAPI CryptUnprotectData failed")
+            ptr = ctypes.cast(blob_out.pbData, ctypes.c_void_p)
+            result = ctypes.string_at(ptr, blob_out.cbData)
+            cls._local_free(blob_out.pbData)
+            return result
 
 
-# ── Encrypted Key Store ──────────────────────────────────────────────────────────
+# ── Platform-aware data directory ────────────────────────────────────────────────
 
-_KEYS_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CustomFlow")
-_KEYS_FILE = os.path.join(_KEYS_DIR, "keys.enc")
+if _IS_WIN:
+    _DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CustomFlow")
+elif _IS_MAC:
+    _DATA_DIR = os.path.join(os.path.expanduser("~"), "Library",
+                             "Application Support", "CustomFlow")
+else:
+    _DATA_DIR = os.path.join(os.path.expanduser("~"), ".config", "CustomFlow")
+
+_KEYS_FILE = os.path.join(_DATA_DIR, "keys.enc")
+
+
+_WIN_USERNAME_RE = re.compile(r'^[A-Za-z0-9._\-@ ]+$')
+
+
+def _win_username() -> str:
+    """Return the current Windows username, validated to safe characters."""
+    name = os.environ.get("USERNAME", "")
+    if not _WIN_USERNAME_RE.match(name):
+        raise ValueError(f"USERNAME contains unexpected characters: {name!r}")
+    return name
 
 
 def _save_encrypted_keys(deepgram_key: str, groq_key: str):
-    """Encrypt API keys with DPAPI and save to user-local storage."""
-    os.makedirs(_KEYS_DIR, exist_ok=True)
+    """Persist API keys. On Windows: DPAPI-encrypted. Otherwise: no-op (use .env)."""
+    if not _IS_WIN:
+        return
+    os.makedirs(_DATA_DIR, exist_ok=True)
     payload = json.dumps({"d": deepgram_key, "g": groq_key}).encode("utf-8")
-    encrypted = _DPAPI.encrypt(payload)
+    encrypted = _DPAPI.encrypt(payload)  # type: ignore[name-defined]
     with open(_KEYS_FILE, "wb") as f:
         f.write(encrypted)
-    # Restrict file to current user only (remove inherited permissions)
-    subprocess.run(
-        ["icacls", _KEYS_FILE, "/inheritance:r",
-         "/grant:r", f"{os.environ.get('USERNAME', '')}:F"],
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["icacls", _KEYS_FILE, "/inheritance:r",
+             "/grant:r", f"{_win_username()}:F"],
+            capture_output=True,
+        )
+    except ValueError as e:
+        logging.error(f"[security] icacls skipped: {e}")
 
 
 def _load_encrypted_keys() -> tuple[str, str]:
-    """Load and decrypt API keys. Returns ("", "") on any failure."""
-    if not os.path.isfile(_KEYS_FILE):
+    """Load and decrypt API keys. Returns ("", "") on any failure or non-Windows."""
+    if not _IS_WIN or not os.path.isfile(_KEYS_FILE):
         return "", ""
     try:
         with open(_KEYS_FILE, "rb") as f:
             encrypted = f.read()
-        payload = json.loads(_DPAPI.decrypt(encrypted).decode("utf-8"))
+        payload = json.loads(_DPAPI.decrypt(encrypted).decode("utf-8"))  # type: ignore[name-defined]
         return payload.get("d", ""), payload.get("g", "")
     except Exception:
         return "", ""
@@ -124,12 +155,12 @@ def _load_encrypted_keys() -> tuple[str, str]:
 
 # ── Error Logging (captures silent crashes in .exe mode) ────────────────────────
 
-_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CustomFlow")
+_LOG_DIR = _DATA_DIR
 os.makedirs(_LOG_DIR, exist_ok=True)
 logging.basicConfig(
     filename=os.path.join(_LOG_DIR, "error.log"),
     level=logging.ERROR,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(message)s",
 )
 
 # Sanitize log records so API keys never reach the log file
@@ -154,22 +185,40 @@ _BASE_DIR = (
 _ENV_FILE = os.path.join(_BASE_DIR, ".env")
 load_dotenv(_ENV_FILE)
 
-# Restrict .env permissions to current user only (runs silently, best-effort)
+# Restrict .env permissions to current user only (best-effort)
 if os.path.isfile(_ENV_FILE):
-    subprocess.run(
-        ["icacls", _ENV_FILE, "/inheritance:r",
-         "/grant:r", f"{os.environ.get('USERNAME', '')}:(R,W)"],
-        capture_output=True,
-    )
+    if _IS_WIN:
+        try:
+            result = subprocess.run(
+                ["icacls", _ENV_FILE, "/inheritance:r",
+                 "/grant:r", f"{_win_username()}:(R,W)"],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                logging.warning(f"[security] icacls on .env failed: {result.stderr.decode(errors='replace')}")
+        except ValueError as e:
+            logging.error(f"[security] icacls on .env skipped: {e}")
+    else:
+        try:
+            os.chmod(_ENV_FILE, 0o600)
+            if os.stat(_ENV_FILE).st_mode & 0o077 != 0:
+                logging.warning("[security] .env is still world-readable after chmod")
+        except OSError as e:
+            logging.warning(f"[security] Failed to restrict .env permissions: {e}")
 
 # Priority: encrypted store > .env > empty
 _enc_dg, _enc_groq = _load_encrypted_keys()
 DEEPGRAM_API_KEY: str = _enc_dg or os.getenv("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY: str = _enc_groq or os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY", "")
+GROQ_API_KEY: str = _enc_groq or os.getenv("GROQ_API_KEY", "")
 
 # Scrub key variables from module scope after client creation (done below)
-HOTKEY_NAME: str = os.getenv("HOTKEY", "right_alt").lower().replace(" ", "_")
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+_HOTKEY_RAW: str = os.getenv("HOTKEY", "right_alt").lower().replace(" ", "_")
+# Validate against whitelist so the value is never used in a dangerous context
+HOTKEY_NAME: str = _HOTKEY_RAW if _HOTKEY_RAW in (
+    "right_alt", "alt_r", "alt_gr", "right_ctrl", "ctrl_r",
+    "right_shift", "shift_r", "caps_lock", "scroll_lock",
+) else "right_alt"
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # fast, non-reasoning
 DEBUG: bool = os.getenv("VOICEFLOW_DEBUG", "").lower() == "true"
 
 GROQ_SYSTEM_PROMPT: str = os.getenv(
@@ -194,12 +243,17 @@ GROQ_SYSTEM_PROMPT: str = os.getenv(
     ),
 )
 
-SAMPLE_RATE = 16_000
+SAMPLE_RATE = 16_000   # preferred; devices fall back to native rate if needed
+# All rates PortAudio might need to try per device, in preference order:
+# 16kHz is ideal for Deepgram; others cover WASAPI/WDM-KS at any Windows config.
+_RATES_TO_TRY = [16000, 44100, 48000, 32000, 22050, 8000]
 CHANNELS = 1
 MIN_RECORDING_SEC = 0.3
 MAX_RECORDING_SEC = 300       # 5-minute hard cap
 MAX_TRANSCRIPT_LEN = 10_000   # Characters — reject abnormally long transcripts
-MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_RECORDING_SEC  # ~9.6 MB at 16-bit PCM
+# Worst case: 48kHz × float32 (4 bytes) × 5 min = ~55 MB. This covers all
+# sample rates and is checked before sending to Deepgram.
+MAX_AUDIO_BYTES = 48000 * 4 * MAX_RECORDING_SEC
 
 _SKIP_MIC = {"stereo mix", "sound mapper", "loopback", "what u hear",
              "wave out", "pc speaker", "primary sound capture"}
@@ -222,6 +276,10 @@ def _sanitize_text(text: str) -> str:
 
 def _validate_transcript(text: str) -> str:
     """Validate and sanitize a transcript before processing."""
+    if not isinstance(text, str):
+        raise TypeError("Transcript must be a string")
+    if "\x00" in text:
+        raise ValueError("Transcript contains null bytes")
     if len(text) > MAX_TRANSCRIPT_LEN:
         raise ValueError(f"Transcript too long ({len(text)} chars, max {MAX_TRANSCRIPT_LEN})")
     return _sanitize_text(text.strip())
@@ -245,8 +303,16 @@ _enc_dg = _enc_groq = ""
 # ── Mic Utilities ───────────────────────────────────────────────────────────────
 
 def _mic_candidates() -> list[int]:
-    seen_names: set[str] = set()
-    candidates: list[int] = []
+    """
+    Return all usable input device IDs, ordered by API preference.
+    We include WDM-KS and all duplicates so Bluetooth headsets are not missed.
+    The probe RMS will pick the device actually receiving audio.
+    """
+    # API preference order: WASAPI first (best quality), then DirectSound, MME, WDM-KS last
+    _API_RANK = {"Windows WASAPI": 0, "Windows DirectSound": 1,
+                 "MME": 2, "Windows WDM-KS": 3}
+
+    candidates: list[tuple[int, int]] = []  # (dev_id, rank)
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] < 1:
             continue
@@ -254,14 +320,12 @@ def _mic_candidates() -> list[int]:
         if any(kw in name for kw in _SKIP_MIC):
             continue
         hostapi = sd.query_hostapis(dev["hostapi"])["name"]
-        if "WDM-KS" in hostapi:
-            continue
-        base = dev["name"].strip()
-        if base in seen_names:
-            continue
-        seen_names.add(base)
-        candidates.append(i)
-    return candidates
+        rank = _API_RANK.get(hostapi, 99)
+        candidates.append((i, rank))
+
+    # Sort by API quality (WASAPI first), then by device id
+    candidates.sort(key=lambda x: (x[1], x[0]))
+    return [dev_id for dev_id, _ in candidates]
 
 
 # ── Hotkey Mapping ──────────────────────────────────────────────────────────────
@@ -283,17 +347,49 @@ HOTKEY_MAP = {
 TARGET_KEY = HOTKEY_MAP.get(HOTKEY_NAME, keyboard.Key.alt_r)
 
 
-# ── Single-Instance Mutex ────────────────────────────────────────────────────────
-# Prevents two copies running at once (double-click, startup + manual launch, etc.)
+def _key_matches(key) -> bool:
+    """Match the configured hotkey, handling alt_gr / alt_r ambiguity on Windows."""
+    if key == TARGET_KEY:
+        return True
+    # Windows sometimes reports AltGr as alt_r and vice-versa
+    if TARGET_KEY in (_alt_gr, keyboard.Key.alt_r):
+        return key in (_alt_gr, keyboard.Key.alt_r)
+    return False
 
-_MUTEX_NAME = "CustomFlow_SingleInstance_Mutex"
-_mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
-if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+
+# ── Single-Instance Guard ────────────────────────────────────────────────────────
+# Windows: named mutex. macOS/Linux: PID file in the data directory.
+
+if _IS_WIN:
+    _MUTEX_NAME = "CustomFlow_SingleInstance_Mutex"
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        try:
+            tk_msg.showwarning("Custom Flow", "Custom Flow is already running.")
+        except Exception:
+            pass
+        sys.exit(0)
+else:
+    import atexit
+    _PID_FILE = os.path.join(_DATA_DIR, "customflow.pid")
+    os.makedirs(_DATA_DIR, exist_ok=True)
     try:
-        tk_msg.showwarning("Custom Flow", "Custom Flow is already running.")
+        if os.path.isfile(_PID_FILE):
+            _old_pid = int(open(_PID_FILE).read().strip())
+            try:
+                os.kill(_old_pid, 0)   # check if process is alive
+                try:
+                    tk_msg.showwarning("Custom Flow", "Custom Flow is already running.")
+                except Exception:
+                    pass
+                sys.exit(0)
+            except OSError:
+                pass  # stale PID — overwrite
+        with open(_PID_FILE, "w") as _pf:
+            _pf.write(str(os.getpid()))
+        atexit.register(lambda: os.unlink(_PID_FILE) if os.path.isfile(_PID_FILE) else None)
     except Exception:
         pass
-    sys.exit(0)
 
 
 # ── Shared State ────────────────────────────────────────────────────────────────
@@ -303,34 +399,48 @@ is_recording = False
 stop_recording_event = threading.Event()
 # maxsize=1: only queue one recording at a time; ignore rapid key-mashing
 event_queue: queue.Queue = queue.Queue(maxsize=1)
-_cached_mic: int | None = None
+
+# Timestamps of last press and release — used to detect fast press+release
+# races without a "stuck" flag. Float writes are GIL-protected in CPython.
+_hotkey_pressed_at: float = 0.0
+_hotkey_released_at: float = 0.0
 
 
 # ── DPI Awareness + Screen Geometry ─────────────────────────────────────────────
 
 # Tell Windows this process is DPI-aware so coordinates are in physical pixels.
 # Without this, on a 150%-scaled screen the pill lands in the wrong corner.
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
-except Exception:
+if _IS_WIN:
     try:
-        ctypes.windll.user32.SetProcessDPIAware()   # Fallback (Win 7+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()   # Fallback (Win 7+)
+        except Exception:
+            pass
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
-class _RECT(ctypes.Structure):
-    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-
-def _get_work_area() -> dict:
-    """Return the usable screen area (excludes taskbar, wherever it is)."""
-    rect = _RECT()
-    SPI_GETWORKAREA = 0x0030
-    ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
-    return {"left": rect.left, "top": rect.top,
-            "right": rect.right, "bottom": rect.bottom}
+def _get_work_area(root: tk.Tk | None = None) -> dict:
+    """Return the usable screen area (excludes taskbar on Windows, estimates on macOS)."""
+    if _IS_WIN:
+        rect = _RECT()
+        SPI_GETWORKAREA = 0x0030
+        ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+        return {"left": rect.left, "top": rect.top,
+                "right": rect.right, "bottom": rect.bottom}
+    else:
+        # macOS / Linux: use tkinter screen dimensions when available.
+        # macOS has a ~25px menu bar at top and ~70px Dock at bottom (approximate).
+        if root is not None:
+            w = root.winfo_screenwidth()
+            h = root.winfo_screenheight()
+        else:
+            w, h = 1920, 1080  # safe fallback
+        return {"left": 0, "top": 25, "right": w, "bottom": h - 70}
 
 
 # ── Overlay Widget ──────────────────────────────────────────────────────────────
@@ -373,9 +483,9 @@ class Overlay:
         _idle_border = self.PALETTE["idle"][2]
         self.root.configure(bg=_idle_border)
 
-        # Position pill above the taskbar using the actual Windows work area
-        # (handles taskbar on any edge, any height, any DPI scaling).
-        wa = _get_work_area()
+        # Position pill using the actual work area
+        # (handles taskbar on Windows, menu bar + Dock on macOS).
+        wa = _get_work_area(root)
         x = wa["right"] - self.W - 20
         y = wa["bottom"] - self.H - 12
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
@@ -564,35 +674,50 @@ class Overlay:
 PROBE_SEC = 0.3
 
 
-def _record_from_device(dev_id: int) -> np.ndarray | None:
+def _to_mono(audio: np.ndarray) -> np.ndarray:
+    """Flatten single-channel (or already-1D) audio to a 1D array."""
+    if audio.ndim == 1:
+        return audio
+    return audio[:, 0]
+
+
+def _record_from_device(dev_id: int, preferred_rate: int = SAMPLE_RATE) -> tuple[np.ndarray, int] | None:
     chunks: list[np.ndarray] = []
+    native = int(sd.query_devices(dev_id)["default_samplerate"])
 
     def cb(indata, frames, time_info, status):
         chunks.append(indata.copy())
 
-    try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            device=dev_id, callback=cb,
-        ):
-            # Hard timeout prevents infinite hangs
-            stop_recording_event.wait(timeout=MAX_RECORDING_SEC)
-    except Exception as e:
-        print(f"[mic] Device {dev_id} failed: {_sanitize_error(e)}", file=sys.stderr)
+    used_rate = SAMPLE_RATE
+    all_rates = list(dict.fromkeys([preferred_rate, SAMPLE_RATE, native] + _RATES_TO_TRY))
+    for i, rate in enumerate(all_rates):
+        chunks.clear()
+        try:
+            with sd.InputStream(
+                samplerate=rate, channels=1, dtype="float32",
+                device=dev_id, callback=cb,
+            ):
+                stop_recording_event.wait(timeout=MAX_RECORDING_SEC)
+            used_rate = rate
+            break  # success
+        except Exception as e:
+            logging.error(f"[TRACE] mic open err | dev={dev_id} rate={rate} {_sanitize_error(e)}")
+            if i == len(all_rates) - 1:
+                return None  # all rates exhausted
+
+    if not chunks:
         return None
+    return _to_mono(np.concatenate(chunks)), used_rate
 
-    return np.concatenate(chunks) if chunks else None
 
-
-def _probe_and_record() -> np.ndarray | None:
-    global _cached_mic
-
+def _probe_and_record() -> tuple[np.ndarray, int] | None:
     candidates = _mic_candidates()
     if not candidates:
-        print("[mic] No input devices found", file=sys.stderr)
+        logging.error("[TRACE] mic probe   | no candidates found")
         return None
 
     buffers: dict[int, list[np.ndarray]] = {i: [] for i in candidates}
+    rates: dict[int, int] = {}
     streams: dict[int, sd.InputStream] = {}
 
     def make_cb(dev_id: int):
@@ -601,17 +726,26 @@ def _probe_and_record() -> np.ndarray | None:
         return cb
 
     for dev_id in candidates:
-        try:
-            s = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                device=dev_id, callback=make_cb(dev_id),
-            )
-            s.start()
-            streams[dev_id] = s
-        except Exception as e:
-            print(f"[mic] Skipping device {dev_id}: {_sanitize_error(e)}", file=sys.stderr)
+        # Try 16kHz first; fall back through all common rates including the
+        # device's native rate. This covers WASAPI endpoints configured at
+        # 44100 Hz, 48000 Hz, or any other Windows Audio Engine setting.
+        native = int(sd.query_devices(dev_id)["default_samplerate"])
+        for rate in dict.fromkeys([SAMPLE_RATE, native] + _RATES_TO_TRY):
+            try:
+                rates[dev_id] = rate
+                s = sd.InputStream(
+                    samplerate=rate, channels=1, dtype="float32",
+                    device=dev_id, callback=make_cb(dev_id),
+                )
+                s.start()
+                streams[dev_id] = s
+                logging.error(f"[TRACE] mic probe   | started dev={dev_id} rate={rate} ch=1")
+                break
+            except Exception as e:
+                logging.error(f"[TRACE] mic probe   | skipped dev={dev_id} rate={rate} err={_sanitize_error(e)}")
 
     if not streams:
+        logging.error("[TRACE] mic probe   | all devices failed")
         return None
 
     deadline = time.monotonic() + PROBE_SEC
@@ -625,11 +759,7 @@ def _probe_and_record() -> np.ndarray | None:
         return float(np.sqrt(np.mean(np.concatenate(c) ** 2)))
 
     best_id = max(streams, key=rms_of)
-    _cached_mic = best_id
-
-    if DEBUG:
-        print(f"[mic] Active: {sd.query_devices(best_id)['name']} "
-              f"(RMS={rms_of(best_id):.4f})")
+    logging.error(f"[TRACE] mic probe   | best dev={best_id} rms={rms_of(best_id):.6f} rate={rates[best_id]}")
 
     for dev_id, s in streams.items():
         if dev_id != best_id:
@@ -642,29 +772,19 @@ def _probe_and_record() -> np.ndarray | None:
     streams[best_id].stop()
     streams[best_id].close()
 
-    return np.concatenate(buffers[best_id]) if buffers[best_id] else None
+    if not buffers[best_id]:
+        return None
+    return _to_mono(np.concatenate(buffers[best_id])), rates[best_id]
 
 
-def record_audio() -> np.ndarray | None:
-    global _cached_mic
-
-    if _cached_mic is not None:
-        audio = _record_from_device(_cached_mic)
-        if audio is not None:
-            rms = float(np.sqrt(np.mean(audio ** 2)))
-            if rms > 0.0005:
-                return audio
-        if DEBUG:
-            print("[mic] Cached device silent, will re-probe next recording")
-        _cached_mic = None
-        return audio
-
+def record_audio() -> tuple[np.ndarray, int] | None:
+    """Returns (audio_array, sample_rate) or None. Always probes for the active mic."""
     return _probe_and_record()
 
 
 # ── Deepgram Transcription ──────────────────────────────────────────────────────
 
-def transcribe(audio: np.ndarray) -> str:
+def transcribe(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
     if _deepgram is None:
         raise RuntimeError("Deepgram API key not configured — add DEEPGRAM_API_KEY to .env")
 
@@ -673,7 +793,7 @@ def transcribe(audio: np.ndarray) -> str:
         raise ValueError("Recording too long")
 
     buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
     audio_bytes = buf.getvalue()
 
     response = _deepgram.listen.v1.media.transcribe_file(
@@ -697,31 +817,53 @@ def clean_and_inject(raw: str, overlay: Overlay):
     if _groq is None:
         raise RuntimeError("Groq API key not configured — add GROQ_API_KEY to .env")
 
-    stream = _groq.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-            {"role": "user", "content": raw},
-        ],
-        temperature=0.0,
-        max_tokens=2048,
-        stream=True,
-    )
+    # Reasoning models (like openai/gpt-oss-120b) consume tokens internally
+    # for "thinking" before producing visible output. A low max_tokens budget
+    # gets exhausted by reasoning, leaving nothing for the actual response.
+    # We detect this by checking for known reasoning model name patterns.
+    _REASONING_MODELS = {"gpt-oss", "reasoning", "think"}
+    _is_reasoning = any(k in GROQ_MODEL.lower() for k in _REASONING_MODELS)
+    _max_tokens = 16000 if _is_reasoning else 2048
 
-    first_chunk = True
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            clean_delta = _sanitize_text(delta)
-            if not clean_delta:
-                continue
-            if first_chunk:
-                time.sleep(0.15)
-                first_chunk = False
-            inject_text(clean_delta)
+    _FALLBACK_MODEL = "llama-3.1-8b-instant"
+    models_to_try = [GROQ_MODEL]
+    if GROQ_MODEL != _FALLBACK_MODEL:
+        models_to_try.append(_FALLBACK_MODEL)
 
-    if DEBUG:
-        print("[groq] streaming complete")
+    for model in models_to_try:
+        stream = _groq.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {"role": "user", "content": raw},
+            ],
+            temperature=0.0,
+            max_tokens=_max_tokens,
+            stream=True,
+        )
+
+        first_chunk = True
+        got_content = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                clean_delta = _sanitize_text(delta)
+                if not clean_delta:
+                    continue
+                if first_chunk:
+                    time.sleep(0.15)
+                    first_chunk = False
+                got_content = True
+                inject_text(clean_delta)
+
+        if DEBUG:
+            print(f"[groq] streaming complete (model={model}, got_content={got_content})")
+
+        if got_content:
+            break
+        # Model returned empty — try fallback
+        if DEBUG:
+            print(f"[groq] model {model!r} returned empty, trying fallback")
 
 
 # ── Text Injection ──────────────────────────────────────────────────────────────
@@ -764,12 +906,25 @@ def pipeline_worker(overlay: Overlay):
             with _recording_lock:
                 is_recording = True
             stop_recording_event.clear()
+            # Guard against race: if the key was released before we cleared
+            # the event, re-signal immediately so recording doesn't hang.
+            race = _hotkey_released_at >= _hotkey_pressed_at
+            if race:
+                stop_recording_event.set()
+            logging.error(f"[TRACE] record start | pressed={_hotkey_pressed_at:.3f} released={_hotkey_released_at:.3f} race={race}")
             overlay.set_recording()
             t_start = time.monotonic()
 
-            audio = record_audio()
+            result = record_audio()
             duration = time.monotonic() - t_start
+            if result is not None:
+                audio, audio_rate = result
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+            else:
+                audio, audio_rate, rms = None, SAMPLE_RATE, -1
+            logging.error(f"[TRACE] record done  | duration={duration:.2f}s audio={'None' if audio is None else audio.shape} rate={audio_rate} rms={rms:.6f}")
         except Exception as exc:
+            logging.error(f"[TRACE] record error  | {_sanitize_error(exc)}")
             print(f"[error] Recording failed: {_sanitize_error(exc)}", file=sys.stderr)
             audio = None
             duration = 0
@@ -784,63 +939,86 @@ def pipeline_worker(overlay: Overlay):
         # ── Transcribe & stream ──
         overlay.set_processing()
         try:
-            raw = transcribe(audio)
-            if DEBUG:
-                print(f"[deepgram] {raw!r}")
+            raw = transcribe(audio, audio_rate)
+            logging.error(f"[TRACE] deepgram    | transcript={raw!r}")
 
             if not raw:
+                logging.error("[TRACE] deepgram    | empty transcript — set_error")
                 overlay.set_error("Nothing heard")
                 continue
 
             clean_and_inject(raw, overlay)
+            logging.error("[TRACE] inject done | back to idle")
             overlay.set_idle()
 
         except (ConnectionError, TimeoutError) as exc:
-            print(f"[error] Network: {_sanitize_error(exc)}", file=sys.stderr)
+            logging.error(f"[TRACE] network err  | {_sanitize_error(exc)}")
             overlay.set_error("Network error")
         except ValueError as exc:
-            print(f"[error] Validation: {_sanitize_error(exc)}", file=sys.stderr)
+            logging.error(f"[TRACE] value err    | {_sanitize_error(exc)}")
             overlay.set_error("Invalid input")
         except RuntimeError as exc:
-            print(f"[error] Config: {_sanitize_error(exc)}", file=sys.stderr)
+            logging.error(f"[TRACE] config err   | {_sanitize_error(exc)}")
             overlay.set_error("Not configured")
         except Exception as exc:
-            print(f"[error] {_sanitize_error(exc)}", file=sys.stderr)
+            logging.error(f"[TRACE] unexpected   | {_sanitize_error(exc)}")
             overlay.set_error("Unexpected error")
 
 
 # ── Keyboard Listener ───────────────────────────────────────────────────────────
 
+_DEBOUNCE_SEC = 0.15   # AltGr bounces on release; ignore presses within this window
+
+
 def on_press(key):
-    with _recording_lock:
-        recording = is_recording
-    if key == TARGET_KEY and not recording:
+    global _hotkey_pressed_at
+    try:
+        if not _key_matches(key):
+            return
+        now = time.monotonic()
+        # Debounce: the physical AltGr key bounces on release, generating a
+        # phantom press ~10-20 ms later. Ignore presses within DEBOUNCE_SEC of
+        # the last release so ghost recordings never reach the pipeline.
+        if _hotkey_released_at > 0 and now - _hotkey_released_at < _DEBOUNCE_SEC:
+            return
+        _hotkey_pressed_at = now
         try:
             event_queue.put_nowait("start")
         except queue.Full:
-            pass  # Already a recording queued — ignore
+            pass  # Already recording — ignore
+    except Exception:
+        pass
 
 
 def on_release(key):
-    with _recording_lock:
-        recording = is_recording
-    if key == TARGET_KEY and recording:
+    global _hotkey_released_at
+    try:
+        if not _key_matches(key):
+            return
+        _hotkey_released_at = time.monotonic()
+        # Always signal stop — no conditional on is_recording.
         stop_recording_event.set()
+    except Exception:
+        pass
 
 
 # ── Install / Uninstall Auto-Start ──────────────────────────────────────────────
 
-_STARTUP_DIR = os.path.join(
-    os.environ.get("APPDATA", ""),
-    "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
-)
-_LNK_NAME = "CustomFlow.lnk"
-_LNK_DST = os.path.join(_STARTUP_DIR, _LNK_NAME)
-
-# For .py mode — VBS launcher
-_VBS_NAME = "start_voiceflow.vbs"
-_VBS_SRC = os.path.join(_BASE_DIR, _VBS_NAME)
-_VBS_DST = os.path.join(_STARTUP_DIR, _VBS_NAME)
+if _IS_WIN:
+    _STARTUP_DIR = os.path.join(
+        os.environ.get("APPDATA", ""),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+    )
+    _LNK_NAME = "CustomFlow.lnk"
+    _LNK_DST = os.path.join(_STARTUP_DIR, _LNK_NAME)
+    # For .py mode — VBS launcher
+    _VBS_NAME = "start_voiceflow.vbs"
+    _VBS_SRC = os.path.join(_BASE_DIR, _VBS_NAME)
+    _VBS_DST = os.path.join(_STARTUP_DIR, _VBS_NAME)
+elif _IS_MAC:
+    _LAUNCH_AGENTS_DIR = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+    _PLIST_NAME = "com.customflow.app.plist"
+    _PLIST_DST = os.path.join(_LAUNCH_AGENTS_DIR, _PLIST_NAME)
 
 
 def _is_frozen() -> bool:
@@ -849,8 +1027,12 @@ def _is_frozen() -> bool:
 
 
 def _is_startup_installed() -> bool:
-    """Return True if either the .lnk or .vbs is present in the Startup folder."""
-    return os.path.isfile(_LNK_DST) or os.path.isfile(_VBS_DST)
+    """Return True if startup item is installed."""
+    if _IS_WIN:
+        return os.path.isfile(_LNK_DST) or os.path.isfile(_VBS_DST)
+    if _IS_MAC:
+        return os.path.isfile(_PLIST_DST)
+    return False
 
 
 def _show_toast(root: tk.Tk, message: str, ok: bool = True):
@@ -890,43 +1072,89 @@ def _show_toast(root: tk.Tk, message: str, ok: bool = True):
 
 
 def _install_startup(silent: bool = False) -> bool:
-    """Add Custom Flow to Windows startup. Returns True on success."""
-    if _is_frozen():
-        exe_path = sys.executable
-        work_dir = os.path.dirname(exe_path)
-        ps_script = (
-            f'$lnk = "{_LNK_DST.replace(chr(34), "")}"; '
-            f'$exe = "{exe_path.replace(chr(34), "")}"; '
-            f'$dir = "{work_dir.replace(chr(34), "")}"; '
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$s = $ws.CreateShortcut($lnk); '
-            f'$s.TargetPath = $exe; '
-            f'$s.WorkingDirectory = $dir; '
-            f'$s.Save()'
+    """Add Custom Flow to startup. Returns True on success."""
+    if _IS_WIN:
+        if _is_frozen():
+            exe_path = sys.executable
+            work_dir = os.path.dirname(exe_path)
+            # Use -EncodedCommand to avoid PowerShell injection via paths
+            # containing backticks, $(), semicolons, or other PS metacharacters.
+            ps_script = (
+                f"$lnk = '{_LNK_DST}'; "
+                f"$exe = '{exe_path}'; "
+                f"$dir = '{work_dir}'; "
+                f"$ws = New-Object -ComObject WScript.Shell; "
+                f"$s = $ws.CreateShortcut($lnk); "
+                f"$s.TargetPath = $exe; "
+                f"$s.WorkingDirectory = $dir; "
+                f"$s.Save()"
+            )
+            ps_b64 = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", ps_b64],
+                capture_output=True,
+            )
+            return result.returncode == 0
+        else:
+            if not os.path.isfile(_VBS_SRC):
+                return False
+            shutil.copy2(_VBS_SRC, _VBS_DST)
+            return True
+    elif _IS_MAC:
+        # macOS auto-start via LaunchAgents plist.
+        # Use plistlib (stdlib) to generate XML — prevents any injection
+        # via paths that contain XML special characters (<, >, &, etc.).
+        python_exec = sys.executable
+        script_path = (
+            sys.executable if _is_frozen()
+            else os.path.abspath(__file__)
         )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True,
-        )
-        return result.returncode == 0
-    else:
-        if not os.path.isfile(_VBS_SRC):
+        os.makedirs(_LAUNCH_AGENTS_DIR, exist_ok=True)
+        # Verify the resolved path stays inside LaunchAgents (symlink safety)
+        if not os.path.abspath(_PLIST_DST).startswith(os.path.abspath(_LAUNCH_AGENTS_DIR)):
+            logging.error("[security] plist path escapes LaunchAgents dir — aborting")
             return False
-        shutil.copy2(_VBS_SRC, _VBS_DST)
-        return True
+        plist_dict = {
+            "Label": "com.customflow.app",
+            "ProgramArguments": [python_exec, script_path],
+            "RunAtLoad": True,
+            "KeepAlive": False,
+        }
+        try:
+            with open(_PLIST_DST, "wb") as f:
+                plistlib.dump(plist_dict, f)
+            subprocess.run(["launchctl", "load", _PLIST_DST], capture_output=True)
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def _uninstall_startup() -> bool:
-    """Remove Custom Flow from Windows startup. Returns True if something was removed."""
-    removed = False
-    for path in (_LNK_DST, _VBS_DST):
-        if os.path.isfile(path):
+    """Remove Custom Flow from startup. Returns True if something was removed."""
+    if _IS_WIN:
+        removed = False
+        for path in (_LNK_DST, _VBS_DST):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed = True
+                except OSError:
+                    pass
+        return removed
+    elif _IS_MAC:
+        if os.path.isfile(_PLIST_DST):
+            # Validate it's actually a regular file (not a symlink pointing elsewhere)
+            if os.path.islink(_PLIST_DST):
+                logging.error("[security] plist path is a symlink — aborting unload")
+                return False
+            subprocess.run(["launchctl", "unload", _PLIST_DST], capture_output=True)
             try:
-                os.remove(path)
-                removed = True
+                os.remove(_PLIST_DST)
+                return True
             except OSError:
                 pass
-    return removed
+    return False
 
 
 # ── Entry Point ─────────────────────────────────────────────────────────────────
@@ -992,14 +1220,34 @@ def main():
         finally:
             _menu.grab_release()
 
-    overlay.canvas.bind("<Button-3>", _show_menu)
+    overlay.canvas.bind("<Button-3>", _show_menu)   # Windows / Linux right-click
+    overlay.canvas.bind("<Button-2>", _show_menu)   # macOS two-finger tap / right-click
 
     worker = threading.Thread(target=pipeline_worker, args=(overlay,), daemon=True)
     worker.start()
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.daemon = True
-    listener.start()
+    def _make_listener():
+        lst = keyboard.Listener(on_press=on_press, on_release=on_release)
+        lst.daemon = True
+        lst.start()
+        return lst
+
+    listener = _make_listener()
+    _listener_ref = [listener]
+
+    def _listener_watchdog():
+        """Restart the keyboard listener if it ever dies silently."""
+        while True:
+            time.sleep(3.0)
+            if not _listener_ref[0].is_alive():
+                logging.warning("Keyboard listener died — restarting")
+                try:
+                    _listener_ref[0] = _make_listener()
+                except Exception as exc:
+                    logging.error(f"Failed to restart listener: {exc}")
+
+    watchdog = threading.Thread(target=_listener_watchdog, daemon=True)
+    watchdog.start()
 
     key_label = HOTKEY_NAME.replace("_", " ").title()
     print(f"[custom flow] Running. Hold [{key_label}] to record. Right-click pill to quit.")
