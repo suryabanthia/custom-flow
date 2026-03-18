@@ -44,8 +44,15 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from deepgram import DeepgramClient
+from deepgram.listen.v1.socket_client import (
+    V1SocketClient as _DgSocketClient,
+    ListenV1ControlMessage as _DgControlMsg,
+)
+from deepgram.extensions.types.sockets.listen_v1_results_event import (
+    ListenV1ResultsEvent as _DgResultsEvent,
+)
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from pynput import keyboard
 from pynput.keyboard import Controller as KbController, Key as KbKey
 
@@ -121,12 +128,12 @@ def _win_username() -> str:
     return name
 
 
-def _save_encrypted_keys(deepgram_key: str, groq_key: str):
+def _save_encrypted_keys(deepgram_key: str, cerebras_key: str):
     """Persist API keys. On Windows: DPAPI-encrypted. Otherwise: no-op (use .env)."""
     if not _IS_WIN:
         return
     os.makedirs(_DATA_DIR, exist_ok=True)
-    payload = json.dumps({"d": deepgram_key, "g": groq_key}).encode("utf-8")
+    payload = json.dumps({"d": deepgram_key, "c": cerebras_key}).encode("utf-8")
     encrypted = _DPAPI.encrypt(payload)  # type: ignore[name-defined]
     with open(_KEYS_FILE, "wb") as f:
         f.write(encrypted)
@@ -148,7 +155,7 @@ def _load_encrypted_keys() -> tuple[str, str]:
         with open(_KEYS_FILE, "rb") as f:
             encrypted = f.read()
         payload = json.loads(_DPAPI.decrypt(encrypted).decode("utf-8"))  # type: ignore[name-defined]
-        return payload.get("d", ""), payload.get("g", "")
+        return payload.get("d", ""), payload.get("c", "")
     except Exception:
         return "", ""
 
@@ -157,18 +164,30 @@ def _load_encrypted_keys() -> tuple[str, str]:
 
 _LOG_DIR = _DATA_DIR
 os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, "error.log")
 logging.basicConfig(
-    filename=os.path.join(_LOG_DIR, "error.log"),
+    filename=_LOG_FILE,
     level=logging.ERROR,
     format="%(asctime)s %(message)s",
 )
+# Restrict log file to current user only
+try:
+    if not _IS_WIN:
+        os.chmod(_LOG_FILE, 0o600)
+except OSError:
+    pass
 
 # Sanitize log records so API keys never reach the log file
 class _SanitizeFilter(logging.Filter):
     _pat = re.compile(r"(gsk_|sk-|sk_live_|key[_-]?)[A-Za-z0-9]{16,}", re.I)
     def filter(self, record):
         record.msg = self._pat.sub("[REDACTED]", str(record.msg))
-        record.args = ()
+        # Also sanitize any positional args that may contain keys
+        if record.args:
+            record.args = tuple(
+                self._pat.sub("[REDACTED]", str(a)) if isinstance(a, str) else a
+                for a in (record.args if isinstance(record.args, tuple) else (record.args,))
+            )
         return True
 
 logging.getLogger().addFilter(_SanitizeFilter())
@@ -183,6 +202,46 @@ _BASE_DIR = (
     else os.path.dirname(os.path.abspath(__file__))
 )
 _ENV_FILE = os.path.join(_BASE_DIR, ".env")
+
+# If .env doesn't exist, prompt user for API keys (first-time setup)
+if not os.path.isfile(_ENV_FILE):
+    print("\n" + "="*50)
+    print("   Custom Flow - First Time Setup")
+    print("="*50 + "\n")
+    print("Get your FREE API keys (1 minute each):\n")
+    print("1. Deepgram (Speech-to-Text)")
+    print("   Go to: https://console.deepgram.com")
+    print("   Sign up → Create API Key")
+    print("   Copy key starting with 'gsk_'\n")
+    print("2. Cerebras (Text Cleanup)")
+    print("   Go to: https://console.cerebras.ai")
+    print("   Sign up → Create API Key")
+    print("   Copy key starting with 'sk_'\n")
+    print("-"*50 + "\n")
+
+    import getpass
+    deepgram_key = getpass.getpass("Paste DEEPGRAM_API_KEY (hidden): ").strip()
+    if not deepgram_key:
+        print("ERROR: API key cannot be empty")
+        sys.exit(1)
+
+    cerebras_key = getpass.getpass("Paste CEREBRAS_API_KEY (hidden): ").strip()
+    if not cerebras_key:
+        print("ERROR: API key cannot be empty")
+        sys.exit(1)
+
+    # Write .env with user-only permissions from the start (no world-readable window)
+    _env_fd = os.open(_ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(_env_fd, "w") as f:
+        f.write(f"DEEPGRAM_API_KEY={deepgram_key}\n")
+        f.write(f"CEREBRAS_API_KEY={cerebras_key}\n")
+        f.write("HOTKEY=right_alt\n")
+
+    print("\n✓ Setup complete! API keys saved.\n")
+    print("="*50)
+    print("   Starting Custom Flow...")
+    print("="*50 + "\n")
+
 load_dotenv(_ENV_FILE)
 
 # Restrict .env permissions to current user only (best-effort)
@@ -207,9 +266,9 @@ if os.path.isfile(_ENV_FILE):
             logging.warning(f"[security] Failed to restrict .env permissions: {e}")
 
 # Priority: encrypted store > .env > empty
-_enc_dg, _enc_groq = _load_encrypted_keys()
+_enc_dg, _enc_cerebras = _load_encrypted_keys()
 DEEPGRAM_API_KEY: str = _enc_dg or os.getenv("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY: str = _enc_groq or os.getenv("GROQ_API_KEY", "")
+CEREBRAS_API_KEY: str = _enc_cerebras or os.getenv("CEREBRAS_API_KEY", "")
 
 # Scrub key variables from module scope after client creation (done below)
 _HOTKEY_RAW: str = os.getenv("HOTKEY", "right_alt").lower().replace(" ", "_")
@@ -218,11 +277,11 @@ HOTKEY_NAME: str = _HOTKEY_RAW if _HOTKEY_RAW in (
     "right_alt", "alt_r", "alt_gr", "right_ctrl", "ctrl_r",
     "right_shift", "shift_r", "caps_lock", "scroll_lock",
 ) else "right_alt"
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # fast, non-reasoning
+CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
 DEBUG: bool = os.getenv("VOICEFLOW_DEBUG", "").lower() == "true"
 
-GROQ_SYSTEM_PROMPT: str = os.getenv(
-    "GROQ_SYSTEM_PROMPT",
+CEREBRAS_SYSTEM_PROMPT: str = os.getenv(
+    "CEREBRAS_SYSTEM_PROMPT",
     (
         "You are a voice transcript post-processor. Clean raw speech into polished written text.\n\n"
         "CLEANUP:\n"
@@ -290,14 +349,18 @@ def _validate_transcript(text: str) -> str:
 _deepgram: DeepgramClient | None = (
     DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None
 )
-_groq: Groq | None = (
-    Groq(api_key=GROQ_API_KEY, timeout=30.0) if GROQ_API_KEY else None
+_cerebras: OpenAI | None = (
+    OpenAI(
+        api_key=CEREBRAS_API_KEY,
+        base_url="https://api.cerebras.ai/v1",
+        timeout=30.0,
+    ) if CEREBRAS_API_KEY else None
 )
 
 # Scrub plaintext keys from module globals after clients are built
 DEEPGRAM_API_KEY = "[loaded]" if _deepgram else ""
-GROQ_API_KEY = "[loaded]" if _groq else ""
-_enc_dg = _enc_groq = ""
+CEREBRAS_API_KEY = "[loaded]" if _cerebras else ""
+_enc_dg = _enc_cerebras = ""
 
 
 # ── Mic Utilities ───────────────────────────────────────────────────────────────
@@ -375,7 +438,8 @@ else:
     os.makedirs(_DATA_DIR, exist_ok=True)
     try:
         if os.path.isfile(_PID_FILE):
-            _old_pid = int(open(_PID_FILE).read().strip())
+            with open(_PID_FILE) as _pf:
+                _old_pid = int(_pf.read().strip())
             try:
                 os.kill(_old_pid, 0)   # check if process is alive
                 try:
@@ -404,6 +468,15 @@ event_queue: queue.Queue = queue.Queue(maxsize=1)
 # races without a "stuck" flag. Float writes are GIL-protected in CPython.
 _hotkey_pressed_at: float = 0.0
 _hotkey_released_at: float = 0.0
+
+# Real-time audio level for sound-reactive pill animation.
+# Updated by the mic callback; read by the animation loop on the UI thread.
+# Float writes are GIL-atomic in CPython — no lock needed.
+_current_audio_rms: float = 0.0
+_SILENCE_THRESHOLD: float = 0.008  # RMS below this = treated as silence
+
+# Cached mic device — avoids the 0.15 s probe on every recording after the first.
+_mic_cache: dict | None = None  # {"dev_id": int, "rate": int}
 
 
 # ── DPI Awareness + Screen Geometry ─────────────────────────────────────────────
@@ -585,7 +658,8 @@ class Overlay:
             self._anim_step = 0
             self._anim_dots()
 
-    # ── Recording animation: bouncing audio bars ──
+    # ── Recording animation: sound-reactive audio bars ──
+    # Bars oscillate only when the mic detects voice; they stay flat during silence.
 
     def _anim_bars(self):
         if self._state != "recording":
@@ -597,16 +671,25 @@ class Overlay:
             fg = "#FFFFFF"
             bar_w = 2.5
             gap = 5
+
+            rms = _current_audio_rms
+            speaking = rms > _SILENCE_THRESHOLD
+            # Scale amplitude to RMS level (clamped 0–1, then mapped to 0–10px swing)
+            amplitude = min(rms / 0.06, 1.0) * 10.0 if speaking else 0.0
+
             for i, offset in enumerate([-gap, 0, gap]):
-                phase = self._anim_step * 0.22 + i * 1.3
-                bar_h = 5 + 7 * abs(math.sin(phase))
+                if speaking:
+                    phase = self._anim_step * 0.25 + i * 1.3
+                    bar_h = 3 + amplitude * abs(math.sin(phase))
+                else:
+                    bar_h = 3  # flat line when silent
                 x = cx + offset
                 self.canvas.create_rectangle(
                     x - bar_w / 2, cy - bar_h / 2,
                     x + bar_w / 2, cy + bar_h / 2,
                     fill=fg, outline="", tags="anim",
                 )
-            self._anim_id = self.root.after(45, self._anim_bars)
+            self._anim_id = self.root.after(40, self._anim_bars)
         except tk.TclError:
             pass
 
@@ -671,7 +754,7 @@ class Overlay:
 
 # ── Audio Recording ─────────────────────────────────────────────────────────────
 
-PROBE_SEC = 0.3
+PROBE_SEC = 0.15   # reduced from 0.3 — 150 ms is enough to pick the active mic
 
 
 def _to_mono(audio: np.ndarray) -> np.ndarray:
@@ -681,114 +764,101 @@ def _to_mono(audio: np.ndarray) -> np.ndarray:
     return audio[:, 0]
 
 
-def _record_from_device(dev_id: int, preferred_rate: int = SAMPLE_RATE) -> tuple[np.ndarray, int] | None:
-    chunks: list[np.ndarray] = []
-    native = int(sd.query_devices(dev_id)["default_samplerate"])
+# ── Deepgram Live Transcription ──────────────────────────────────────────────────
+#
+# Audio is streamed to Deepgram via WebSocket *while the user is speaking*.
+# By the time they release the hotkey the transcript is largely ready —
+# the final flush takes only ~100–200 ms instead of 1–2 s for the REST path.
 
-    def cb(indata, frames, time_info, status):
-        chunks.append(indata.copy())
+def _transcribe_live(
+    audio_q: "queue.Queue[np.ndarray | None]",
+    sample_rate: int,
+) -> str:
+    """Stream float32 mono chunks to Deepgram WebSocket via dg.listen.v1.connect().
+    Put None into audio_q to signal end-of-audio.
+    Returns assembled final transcript, or "" on any failure (caller falls back to REST).
+    """
+    if _deepgram is None:
+        return ""
 
-    used_rate = SAMPLE_RATE
-    all_rates = list(dict.fromkeys([preferred_rate, SAMPLE_RATE, native] + _RATES_TO_TRY))
-    for i, rate in enumerate(all_rates):
-        chunks.clear()
-        try:
-            with sd.InputStream(
-                samplerate=rate, channels=1, dtype="float32",
-                device=dev_id, callback=cb,
-            ):
-                stop_recording_event.wait(timeout=MAX_RECORDING_SEC)
-            used_rate = rate
-            break  # success
-        except Exception as e:
-            logging.error(f"[TRACE] mic open err | dev={dev_id} rate={rate} {_sanitize_error(e)}")
-            if i == len(all_rates) - 1:
-                return None  # all rates exhausted
+    parts: list[str] = []
 
-    if not chunks:
-        return None
-    return _to_mono(np.concatenate(chunks)), used_rate
+    try:
+        with _deepgram.listen.v1.connect(
+            model="nova-3",
+            encoding="linear16",
+            sample_rate=str(sample_rate),
+            language="en",
+            smart_format="true",
+            interim_results="false",
+            endpointing="300",   # 300 ms silence → emit a final segment mid-stream
+        ) as conn:
+            recv_done = threading.Event()
 
+            def _recv_loop():
+                try:
+                    while True:
+                        event = conn.recv()
+                        if isinstance(event, _DgResultsEvent) and event.is_final:
+                            try:
+                                t = event.channel.alternatives[0].transcript
+                                if t:
+                                    parts.append(t)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                finally:
+                    recv_done.set()
 
-def _probe_and_record() -> tuple[np.ndarray, int] | None:
-    candidates = _mic_candidates()
-    if not candidates:
-        logging.error("[TRACE] mic probe   | no candidates found")
-        return None
+            recv_thread = threading.Thread(target=_recv_loop, daemon=True)
+            recv_thread.start()
 
-    buffers: dict[int, list[np.ndarray]] = {i: [] for i in candidates}
-    rates: dict[int, int] = {}
-    streams: dict[int, sd.InputStream] = {}
+            # Feed audio chunks as they arrive from the mic
+            while True:
+                try:
+                    chunk = audio_q.get(timeout=0.3)
+                except queue.Empty:
+                    if stop_recording_event.is_set():
+                        break
+                    continue
+                if chunk is None:
+                    break
+                pcm = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                try:
+                    conn.send_media(pcm.tobytes())
+                except Exception as e:
+                    logging.error(f"[TRACE] dg live | send error: {_sanitize_error(e)}")
+                    break
 
-    def make_cb(dev_id: int):
-        def cb(indata, frames, time_info, status):
-            buffers[dev_id].append(indata.copy())
-        return cb
-
-    for dev_id in candidates:
-        # Try 16kHz first; fall back through all common rates including the
-        # device's native rate. This covers WASAPI endpoints configured at
-        # 44100 Hz, 48000 Hz, or any other Windows Audio Engine setting.
-        native = int(sd.query_devices(dev_id)["default_samplerate"])
-        for rate in dict.fromkeys([SAMPLE_RATE, native] + _RATES_TO_TRY):
+            # Tell Deepgram to flush remaining audio and close
             try:
-                rates[dev_id] = rate
-                s = sd.InputStream(
-                    samplerate=rate, channels=1, dtype="float32",
-                    device=dev_id, callback=make_cb(dev_id),
-                )
-                s.start()
-                streams[dev_id] = s
-                logging.error(f"[TRACE] mic probe   | started dev={dev_id} rate={rate} ch=1")
-                break
-            except Exception as e:
-                logging.error(f"[TRACE] mic probe   | skipped dev={dev_id} rate={rate} err={_sanitize_error(e)}")
+                conn.send_control(_DgControlMsg(type="Finalize"))
+                conn.send_control(_DgControlMsg(type="CloseStream"))
+            except Exception:
+                pass
 
-    if not streams:
-        logging.error("[TRACE] mic probe   | all devices failed")
-        return None
+            recv_done.wait(timeout=4.0)
 
-    deadline = time.monotonic() + PROBE_SEC
-    while time.monotonic() < deadline and not stop_recording_event.is_set():
-        time.sleep(0.02)
+    except Exception as e:
+        logging.error(f"[TRACE] dg live | connection error: {_sanitize_error(e)}")
+        return ""
 
-    def rms_of(dev_id: int) -> float:
-        c = buffers[dev_id]
-        if not c:
-            return 0.0
-        return float(np.sqrt(np.mean(np.concatenate(c) ** 2)))
-
-    best_id = max(streams, key=rms_of)
-    logging.error(f"[TRACE] mic probe   | best dev={best_id} rms={rms_of(best_id):.6f} rate={rates[best_id]}")
-
-    for dev_id, s in streams.items():
-        if dev_id != best_id:
-            s.stop()
-            s.close()
-
-    if not stop_recording_event.is_set():
-        stop_recording_event.wait(timeout=MAX_RECORDING_SEC)
-
-    streams[best_id].stop()
-    streams[best_id].close()
-
-    if not buffers[best_id]:
-        return None
-    return _to_mono(np.concatenate(buffers[best_id])), rates[best_id]
+    raw = " ".join(parts).strip()
+    if not raw:
+        return ""
+    try:
+        return _validate_transcript(raw)
+    except Exception:
+        return raw
 
 
-def record_audio() -> tuple[np.ndarray, int] | None:
-    """Returns (audio_array, sample_rate) or None. Always probes for the active mic."""
-    return _probe_and_record()
+# ── REST fallback transcription ──────────────────────────────────────────────────
 
-
-# ── Deepgram Transcription ──────────────────────────────────────────────────────
-
-def transcribe(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
+def _transcribe_rest(audio: np.ndarray, sample_rate: int) -> str:
+    """Blocking REST transcription — used when live streaming gives no result."""
     if _deepgram is None:
         raise RuntimeError("Deepgram API key not configured — add DEEPGRAM_API_KEY to .env")
-
-    # Audio size guard
     if audio.nbytes > MAX_AUDIO_BYTES:
         raise ValueError("Recording too long")
 
@@ -809,61 +879,225 @@ def transcribe(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
         return ""
 
 
-# ── Groq Streaming + Text Injection ─────────────────────────────────────────────
+# ── Fast filler-word cleanup (no LLM) ────────────────────────────────────────────
+#
+# Deepgram nova-3 with smart_format already handles punctuation, capitalisation,
+# and number formatting. We only strip filler words — ~1 ms, no network call.
+
+_FILLER_RE = re.compile(
+    r"\b(um+h?|uh+|hmm+|erm?|err+|ah+|"
+    r"you\s+know|i\s+mean|sort\s+of|kind\s+of|basically)\b"
+    r"[,\s]*",
+    re.IGNORECASE,
+)
+
+
+def _fast_clean(text: str) -> str:
+    """Strip filler words and tidy up spacing. ~1 ms."""
+    if not text:
+        return text
+    cleaned = _FILLER_RE.sub(" ", text)
+    cleaned = re.sub(r"  +", " ", cleaned).strip()
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
+
+# ── Combined record + live-transcribe ────────────────────────────────────────────
+#
+# Deepgram WebSocket receives audio WHILE the user is still speaking.
+# Timeline:  press → [probe 0 ms if cached | 150 ms if first use]
+#                  → record + stream to Deepgram simultaneously
+#                  → release → flush Deepgram (~100–200 ms)
+#                  → transcript ready, inject
+#
+# Compared with the old sequential approach (record → upload → REST → LLM):
+#   old: ~0 ms record overhead + ~1–2 s Deepgram REST + ~1–3 s Cerebras = 2–5 s
+#   new: ~0 ms record overhead + ~100–200 ms final flush = < 0.3 s
+
+def _record_and_transcribe() -> tuple[str, float] | None:
+    """Record audio and transcribe in parallel. Returns (transcript, duration) or None."""
+    global _mic_cache, _current_audio_rms
+
+    # ── Pick or probe mic ──
+    dev_id: int | None = None
+    used_rate: int = SAMPLE_RATE
+    used_cache = _mic_cache is not None
+
+    if _mic_cache:
+        dev_id = _mic_cache["dev_id"]
+        used_rate = _mic_cache["rate"]
+        logging.error(f"[TRACE] mic cache    | dev={dev_id} rate={used_rate}")
+    else:
+        candidates = _mic_candidates()
+        if not candidates:
+            logging.error("[TRACE] mic probe   | no candidates found")
+            return None
+
+        p_bufs: dict[int, list] = {i: [] for i in candidates}
+        p_rates: dict[int, int] = {}
+        p_streams: dict[int, sd.InputStream] = {}
+
+        def _make_probe_cb(d: int):
+            def cb(indata, frames, t, s):
+                p_bufs[d].append(indata.copy())
+            return cb
+
+        for did in candidates:
+            native = int(sd.query_devices(did)["default_samplerate"])
+            for rate in dict.fromkeys([SAMPLE_RATE, native] + _RATES_TO_TRY):
+                try:
+                    ps = sd.InputStream(samplerate=rate, channels=1, dtype="float32",
+                                        device=did, callback=_make_probe_cb(did))
+                    ps.start()
+                    p_rates[did] = rate
+                    p_streams[did] = ps
+                    logging.error(f"[TRACE] mic probe   | started dev={did} rate={rate}")
+                    break
+                except Exception as e:
+                    logging.error(f"[TRACE] mic probe   | skipped dev={did} rate={rate} err={_sanitize_error(e)}")
+
+        if not p_streams:
+            logging.error("[TRACE] mic probe   | all devices failed")
+            return None
+
+        deadline = time.monotonic() + PROBE_SEC
+        while time.monotonic() < deadline and not stop_recording_event.is_set():
+            time.sleep(0.02)
+
+        def _rms(d: int) -> float:
+            c = p_bufs[d]
+            return float(np.sqrt(np.mean(np.concatenate(c) ** 2))) if c else 0.0
+
+        best_id = max(p_streams, key=_rms)
+        logging.error(f"[TRACE] mic probe   | best dev={best_id} rms={_rms(best_id):.6f}")
+        for did, ps in p_streams.items():
+            ps.stop(); ps.close()
+
+        if stop_recording_event.is_set():
+            return None
+
+        dev_id = best_id
+        used_rate = p_rates[best_id]
+        _mic_cache = {"dev_id": dev_id, "rate": used_rate}
+
+    # ── Launch Deepgram live-transcription thread ──
+    audio_q: queue.Queue = queue.Queue(maxsize=1000)
+    transcript_holder: list[str] = [""]
+    all_chunks: list[np.ndarray] = []   # kept for REST fallback
+
+    def _dg_worker():
+        try:
+            result = _transcribe_live(audio_q, used_rate)
+            if result:
+                transcript_holder[0] = result
+        except Exception as e:
+            logging.error(f"[TRACE] dg worker   | {_sanitize_error(e)}")
+
+    dg_thread = threading.Thread(target=_dg_worker, daemon=True)
+    dg_thread.start()
+
+    # ── Record — feed every chunk to Deepgram in real-time ──
+    t_start = time.monotonic()
+
+    def rec_cb(indata, frames, time_info, status):
+        global _current_audio_rms
+        chunk = _to_mono(indata.copy())
+        all_chunks.append(chunk)
+        chunk_rms = float(np.sqrt(np.mean(chunk ** 2)))
+        _current_audio_rms = 0.4 * chunk_rms + 0.6 * _current_audio_rms
+        try:
+            audio_q.put_nowait(chunk)
+        except queue.Full:
+            pass   # drop — Deepgram thread is falling behind
+
+    try:
+        with sd.InputStream(samplerate=used_rate, channels=1, dtype="float32",
+                            device=dev_id, callback=rec_cb):
+            stop_recording_event.wait(timeout=MAX_RECORDING_SEC)
+    except Exception as e:
+        logging.error(f"[TRACE] rec error   | dev={dev_id} {_sanitize_error(e)}")
+        if used_cache:
+            _mic_cache = None   # cached device failed — re-probe next time
+        _current_audio_rms = 0.0
+        audio_q.put(None)
+        dg_thread.join(timeout=2.0)
+        return None
+
+    duration = time.monotonic() - t_start
+    _current_audio_rms = 0.0
+    audio_q.put(None)   # signal Deepgram thread to flush and close
+
+    if duration < MIN_RECORDING_SEC:
+        dg_thread.join(timeout=2.0)
+        return None
+
+    # Deepgram has been transcribing while recording; just wait for the final flush.
+    dg_thread.join(timeout=5.0)
+    transcript = transcript_holder[0]
+
+    # ── REST fallback if streaming gave nothing ──
+    if not transcript and all_chunks:
+        logging.error("[TRACE] live gave no result — falling back to REST")
+        try:
+            audio_full = np.concatenate(all_chunks)
+            transcript = _transcribe_rest(audio_full, used_rate)
+        except Exception as e:
+            logging.error(f"[TRACE] REST fallback | {_sanitize_error(e)}")
+
+    if not transcript:
+        return None
+
+    return transcript, duration
+
+
+# ── Cerebras Streaming + Text Injection ─────────────────────────────────────────
 
 def clean_and_inject(raw: str, overlay: Overlay):
     if not raw:
         return
-    if _groq is None:
-        raise RuntimeError("Groq API key not configured — add GROQ_API_KEY to .env")
+    if _cerebras is None:
+        raise RuntimeError("Cerebras API key not configured — add CEREBRAS_API_KEY to .env")
 
-    # Reasoning models (like openai/gpt-oss-120b) consume tokens internally
-    # for "thinking" before producing visible output. A low max_tokens budget
-    # gets exhausted by reasoning, leaving nothing for the actual response.
-    # We detect this by checking for known reasoning model name patterns.
-    _REASONING_MODELS = {"gpt-oss", "reasoning", "think"}
-    _is_reasoning = any(k in GROQ_MODEL.lower() for k in _REASONING_MODELS)
-    _max_tokens = 16000 if _is_reasoning else 2048
-
-    _FALLBACK_MODEL = "llama-3.1-8b-instant"
-    models_to_try = [GROQ_MODEL]
-    if GROQ_MODEL != _FALLBACK_MODEL:
+    _FALLBACK_MODEL = "llama3.1-8b"
+    models_to_try = [CEREBRAS_MODEL]
+    if CEREBRAS_MODEL != _FALLBACK_MODEL:
         models_to_try.append(_FALLBACK_MODEL)
 
     for model in models_to_try:
-        stream = _groq.chat.completions.create(
+        t0 = time.monotonic()
+        stream = _cerebras.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": GROQ_SYSTEM_PROMPT},
+                {"role": "system", "content": CEREBRAS_SYSTEM_PROMPT},
                 {"role": "user", "content": raw},
             ],
             temperature=0.0,
-            max_tokens=_max_tokens,
+            max_tokens=1024,
             stream=True,
         )
 
-        first_chunk = True
+        # Collect all chunks first, then paste in one shot.
+        # This cuts injection time from ~5-15 s (char-by-char) to ~50 ms (clipboard).
+        collected: list[str] = []
         got_content = False
         for chunk in stream:
             delta = chunk.choices[0].delta.content
             if delta:
                 clean_delta = _sanitize_text(delta)
-                if not clean_delta:
-                    continue
-                if first_chunk:
-                    time.sleep(0.15)
-                    first_chunk = False
-                got_content = True
-                inject_text(clean_delta)
+                if clean_delta:
+                    collected.append(clean_delta)
+                    got_content = True
 
         if DEBUG:
-            print(f"[groq] streaming complete (model={model}, got_content={got_content})")
+            elapsed = time.monotonic() - t0
+            print(f"[cerebras] complete (model={model}, got_content={got_content}, {elapsed:.2f}s)")
 
         if got_content:
+            inject_text("".join(collected))
             break
-        # Model returned empty — try fallback
         if DEBUG:
-            print(f"[groq] model {model!r} returned empty, trying fallback")
+            print(f"[cerebras] model {model!r} returned empty, trying fallback")
 
 
 # ── Text Injection ──────────────────────────────────────────────────────────────
@@ -872,17 +1106,33 @@ _kb = KbController()
 
 
 def inject_text(text: str):
+    """Inject text via keystroke simulation.
+
+    Splits on newline/tab (which need real key presses) and calls _kb.type()
+    on each segment as a whole string — far faster than one call per character
+    while avoiding any clipboard interaction.
+    """
     if not text:
         return
+    # Walk through runs of plain text separated by \n / \t
+    segment: list[str] = []
     for char in text:
         if char == "\n":
+            if segment:
+                _kb.type("".join(segment))
+                segment.clear()
             _kb.press(KbKey.enter)
             _kb.release(KbKey.enter)
         elif char == "\t":
+            if segment:
+                _kb.type("".join(segment))
+                segment.clear()
             _kb.press(KbKey.tab)
             _kb.release(KbKey.tab)
         else:
-            _kb.type(char)
+            segment.append(char)
+    if segment:
+        _kb.type("".join(segment))
 
 
 # ── Pipeline Worker ─────────────────────────────────────────────────────────────
@@ -901,7 +1151,7 @@ def pipeline_worker(overlay: Overlay):
         if event != "start":
             continue
 
-        # ── Record ──
+        # ── Record + Transcribe (parallel via Deepgram WebSocket) ──
         try:
             with _recording_lock:
                 is_recording = True
@@ -913,42 +1163,66 @@ def pipeline_worker(overlay: Overlay):
                 stop_recording_event.set()
             logging.error(f"[TRACE] record start | pressed={_hotkey_pressed_at:.3f} released={_hotkey_released_at:.3f} race={race}")
             overlay.set_recording()
-            t_start = time.monotonic()
 
-            result = record_audio()
-            duration = time.monotonic() - t_start
-            if result is not None:
-                audio, audio_rate = result
-                rms = float(np.sqrt(np.mean(audio ** 2)))
-            else:
-                audio, audio_rate, rms = None, SAMPLE_RATE, -1
-            logging.error(f"[TRACE] record done  | duration={duration:.2f}s audio={'None' if audio is None else audio.shape} rate={audio_rate} rms={rms:.6f}")
+            result = _record_and_transcribe()
         except Exception as exc:
-            logging.error(f"[TRACE] record error  | {_sanitize_error(exc)}")
+            logging.error(f"[TRACE] record error | {_sanitize_error(exc)}")
             print(f"[error] Recording failed: {_sanitize_error(exc)}", file=sys.stderr)
-            audio = None
-            duration = 0
+            result = None
         finally:
             with _recording_lock:
                 is_recording = False
 
-        if audio is None or duration < MIN_RECORDING_SEC:
+        if result is None:
             overlay.set_idle()
             continue
 
-        # ── Transcribe & stream ──
+        transcript, duration = result
+        logging.error(f"[TRACE] transcript   | duration={duration:.2f}s text={transcript!r}")
+
+        # ── Clean + Inject ──
         overlay.set_processing()
         try:
-            raw = transcribe(audio, audio_rate)
-            logging.error(f"[TRACE] deepgram    | transcript={raw!r}")
+            # Try Cerebras first (llama3.1-8b is fast on Cerebras hardware ~300-600ms).
+            # Fall back to regex-only if Cerebras is not configured or fails.
+            cleaned = None
+            if _cerebras is not None:
+                try:
+                    t_llm = time.monotonic()
+                    stream = _cerebras.chat.completions.create(
+                        model=CEREBRAS_MODEL,
+                        messages=[
+                            {"role": "system", "content": CEREBRAS_SYSTEM_PROMPT},
+                            {"role": "user", "content": transcript},
+                        ],
+                        temperature=0.0,
+                        max_tokens=1024,
+                        stream=True,
+                    )
+                    parts: list[str] = []
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            clean_delta = _sanitize_text(delta)
+                            if clean_delta:
+                                parts.append(clean_delta)
+                    if parts:
+                        cleaned = "".join(parts).strip()
+                    logging.error(f"[TRACE] cerebras    | {time.monotonic()-t_llm:.2f}s result={cleaned!r}")
+                except Exception as e:
+                    logging.error(f"[TRACE] cerebras err | {_sanitize_error(e)}")
 
-            if not raw:
-                logging.error("[TRACE] deepgram    | empty transcript — set_error")
+            if not cleaned:
+                cleaned = _fast_clean(transcript)
+
+            if not cleaned:
+                logging.error("[TRACE] empty after clean — set_error")
                 overlay.set_error("Nothing heard")
                 continue
 
-            clean_and_inject(raw, overlay)
-            logging.error("[TRACE] inject done | back to idle")
+            t_inject = time.monotonic()
+            inject_text(cleaned)
+            logging.error(f"[TRACE] inject done  | {time.monotonic()-t_inject:.3f}s — back to idle")
             overlay.set_idle()
 
         except (ConnectionError, TimeoutError) as exc:
@@ -1079,10 +1353,13 @@ def _install_startup(silent: bool = False) -> bool:
             work_dir = os.path.dirname(exe_path)
             # Use -EncodedCommand to avoid PowerShell injection via paths
             # containing backticks, $(), semicolons, or other PS metacharacters.
+            # Escape single quotes in paths so they can't break out of PS strings
+            def _ps_esc(s: str) -> str:
+                return s.replace("'", "''")
             ps_script = (
-                f"$lnk = '{_LNK_DST}'; "
-                f"$exe = '{exe_path}'; "
-                f"$dir = '{work_dir}'; "
+                f"$lnk = '{_ps_esc(_LNK_DST)}'; "
+                f"$exe = '{_ps_esc(exe_path)}'; "
+                f"$dir = '{_ps_esc(work_dir)}'; "
                 f"$ws = New-Object -ComObject WScript.Shell; "
                 f"$s = $ws.CreateShortcut($lnk); "
                 f"$s.TargetPath = $exe; "
@@ -1176,8 +1453,8 @@ def main():
 
     if not _deepgram:
         print("[warn] DEEPGRAM_API_KEY not set. Add it to .env", file=sys.stderr)
-    if not _groq:
-        print("[warn] GROQ_API_KEY not set. Add it to .env", file=sys.stderr)
+    if not _cerebras:
+        print("[warn] CEREBRAS_API_KEY not set. Add it to .env", file=sys.stderr)
 
     # Auto-install to startup on very first launch (silent, no dialog)
     _STARTUP_FLAG = os.path.join(_LOG_DIR, "startup_installed")
@@ -1271,7 +1548,7 @@ if __name__ == "__main__":
             tk_msg.showerror(
                 "Custom Flow — Error",
                 f"Custom Flow failed to start.\n\n"
-                f"Error: {exc}\n\n"
+                f"Error: {_sanitize_error(exc)}\n\n"
                 f"Details saved to:\n{_log_path}",
             )
         except Exception:

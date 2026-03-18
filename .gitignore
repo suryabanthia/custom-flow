@@ -1,8 +1,27 @@
+# API keys — never commit
 .env
 keys.enc
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Build artifacts
 dist/
 build/
 *.spec
 *.exe
+
+# Logs & debug
+*.log
+debug_output.txt
+nul
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+release-packages/
+INSTALL.bat
