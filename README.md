@@ -10,83 +10,115 @@ Works on **Windows** and **macOS**.
 
 1. You hold the hotkey (default: Right Alt on Windows / Right Option on Mac)
 2. Speak — the pill in the bottom-right corner turns orange and animates
-3. Release the hotkey — your speech is transcribed by Deepgram, then cleaned up by Groq
+3. Release the hotkey — your speech is transcribed by Deepgram, then cleaned up by Cerebras
 4. The polished text is typed into whatever app is focused (text editor, browser, Slack, etc.)
 
 Lists, paragraphs, and punctuation are handled automatically. Filler words (um, uh, like) are removed.
 
 ---
 
-## Setup — Windows
+## Step 1 — Download the Code
 
-No Python needed. Just:
+### Option A: Download ZIP (Easiest — No Git Required)
 
-1. Download `CustomFlow.exe` and `.env` into the same folder
-2. Open `.env` in Notepad and fill in your API keys:
-   ```
-   DEEPGRAM_API_KEY=your_deepgram_key_here
-   GROQ_API_KEY=your_groq_key_here
-   ```
-3. Double-click `CustomFlow.exe`
+1. Open your web browser
+2. Go to: **https://github.com/suryabanthia/custom-flow**
+3. Click the green **"Code"** button
+4. Click **"Download ZIP"**
+5. Extract the ZIP file to any folder (e.g., `Documents\custom-flow`)
 
-That's it. The pill appears in the bottom-right corner — you're ready to dictate.
+### Option B: Clone with Git (For Users with Git Installed)
+
+Open Terminal (Mac) or Command Prompt (Windows) and run:
+```bash
+git clone https://github.com/suryabanthia/custom-flow.git
+```
+
+Then navigate into the folder:
+```bash
+cd custom-flow
+```
 
 ---
 
-## Setup — macOS
+## Step 2 — Install Python
 
-Mac users need Python and a few packages installed first.
+### Windows
 
-### Step 1 — Install Python
+1. Download Python from **https://python.org/downloads**
+2. Run the installer
+3. **Important:** Check the box that says **"Add Python to PATH"**
+4. Click "Install Now"
+
+### macOS
 
 Check if Python 3 is already installed:
 ```bash
 python3 --version
 ```
 
-If not, download it from [python.org/downloads](https://www.python.org/downloads/) and install it.
+If not, download it from **https://python.org/downloads** and install it.
 
-### Step 2 — Install dependencies
+---
 
-Open Terminal and run:
+## Step 3 — Install Dependencies
+
+Open Terminal (Mac) or Command Prompt (Windows), navigate to the project folder, and run:
+
 ```bash
-pip3 install deepgram-sdk groq sounddevice soundfile numpy pynput python-dotenv
+pip install -r requirements.txt
 ```
 
-You only need to do this once.
+This installs all required packages. You only need to do this once.
 
-### Step 3 — Add your API keys
+---
 
-In the project folder, copy the example config:
+## Step 4 — Add Your API Keys
+
+### Get Your Keys (Both Are Free)
+
+1. **Deepgram** — [console.deepgram.com](https://console.deepgram.com)
+   - Sign up → Create a new API key
+
+2. **Cerebras** — [console.cerebras.ai](https://console.cerebras.ai)
+   - Sign up → Create a new API key
+
+### Create the .env File
+
+1. Copy `.env.example` to `.env`:
+   - **Windows (Command Prompt):** `copy .env.example .env`
+   - **Windows (PowerShell):** `Copy-Item .env.example .env`
+   - **macOS:** `cp .env.example .env`
+
+2. Open `.env` in any text editor (Notepad, TextEdit, VS Code, etc.)
+
+3. Paste your API keys:
+   ```
+   DEEPGRAM_API_KEY=your_deepgram_key_here
+   CEREBRAS_API_KEY=your_cerebras_key_here
+   ```
+
+---
+
+## Step 5 — Run the App
+
 ```bash
-cp .env.example .env
+python main.py
 ```
 
-Open `.env` in any text editor and fill in:
-```
-DEEPGRAM_API_KEY=your_deepgram_key_here
-GROQ_API_KEY=your_groq_key_here
-```
-
-### Step 4 — Run
-
+Or on Mac:
 ```bash
 python3 main.py
 ```
 
 The pill appears in the bottom-right corner — you're ready to dictate.
 
-> **First run:** macOS will ask for microphone permission — click Allow.
-> If the hotkey doesn't respond, go to **System Settings → Privacy & Security → Accessibility** and enable access for Terminal.
+> **First run (macOS):**
+> - macOS will ask for microphone permission — click **Allow**
+> - If the hotkey doesn't respond, go to **System Settings → Privacy & Security → Accessibility** and enable Terminal
 
----
-
-## Where to Get API Keys
-
-Both are free — no credit card needed.
-
-- **Deepgram:** [console.deepgram.com](https://console.deepgram.com) → Create a new API key
-- **Groq:** [console.groq.com](https://console.groq.com) → API Keys → Create new
+> **First run (Windows):**
+> - Windows may ask for microphone permission — click **Allow**
 
 ---
 
@@ -109,15 +141,15 @@ Both are free — no credit card needed.
 ## Platform Notes
 
 ### Windows
-- The `.exe` has its own microphone privacy entry — no extra permissions needed
-- `CustomFlow.exe --install` adds it to Windows startup automatically
-- `CustomFlow.exe --uninstall` removes it
+- Grant microphone access: **Settings → Privacy → Microphone**
+- `python main.py --install` adds it to Windows startup
+- `python main.py --uninstall` removes it
 
 ### macOS
 - Hotkey is **Right Option** (same physical key as Right Alt on Windows keyboards)
 - Grant microphone access: **System Settings → Privacy & Security → Microphone → Terminal**
 - Grant hotkey access: **System Settings → Privacy & Security → Accessibility → Terminal**
-- `python3 main.py --install` adds it to login items (auto-starts on login)
+- `python3 main.py --install` adds it to login items
 - `python3 main.py --uninstall` removes it
 
 ---
@@ -127,9 +159,9 @@ Both are free — no credit card needed.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEEPGRAM_API_KEY` | *(required)* | Deepgram API key |
-| `GROQ_API_KEY` | *(required)* | Groq API key |
+| `CEREBRAS_API_KEY` | *(required)* | Cerebras API key |
 | `HOTKEY` | `right_alt` | Hotkey to use. Options: `right_alt`, `right_ctrl`, `right_shift`, `caps_lock` |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model for text cleanup |
+| `CEREBRAS_MODEL` | `qwen-3-235b-a22b-instruct-2507` | Cerebras model for text cleanup |
 | `VOICEFLOW_DEBUG` | `false` | Set to `true` to print transcripts to the console |
 
 ---
@@ -148,20 +180,24 @@ Both are free — no credit card needed.
 - Check your microphone input level in system sound settings
 
 **Pill doesn't appear:**
-- Windows: check Task Manager for a running CustomFlow.exe
-- Mac: check Activity Monitor for a running Python process
+- Check Task Manager (Windows) or Activity Monitor (Mac) for a running Python process
+- Make sure you ran `pip install -r requirements.txt` successfully
 
 **Hotkey doesn't respond on Mac:**
 - Go to **System Settings → Privacy & Security → Accessibility** and enable Terminal
 
+**"Module not found" error:**
+- Make sure you ran: `pip install -r requirements.txt`
+- On Mac, try: `pip3 install -r requirements.txt`
+
 ---
 
-## Dependencies (macOS only — Windows .exe bundles these automatically)
+## Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
 | `deepgram-sdk` | 5.3.2 | Speech-to-text transcription |
-| `groq` | 1.0.0 | AI text cleanup |
+| `openai` | 1.61.0 | API client (used for Cerebras) |
 | `sounddevice` | 0.5.5 | Microphone audio capture |
 | `soundfile` | 0.13.1 | WAV audio encoding |
 | `numpy` | 2.4.2 | Audio processing |
