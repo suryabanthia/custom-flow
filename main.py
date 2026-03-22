@@ -277,28 +277,23 @@ HOTKEY_NAME: str = _HOTKEY_RAW if _HOTKEY_RAW in (
     "right_alt", "alt_r", "alt_gr", "right_ctrl", "ctrl_r",
     "right_shift", "shift_r", "caps_lock", "scroll_lock",
 ) else "right_alt"
-CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507")
 DEBUG: bool = os.getenv("VOICEFLOW_DEBUG", "").lower() == "true"
 
 CEREBRAS_SYSTEM_PROMPT: str = os.getenv(
     "CEREBRAS_SYSTEM_PROMPT",
     (
-        "You are a voice transcript post-processor. Clean raw speech into polished written text.\n\n"
-        "CLEANUP:\n"
-        "- Remove filler words: um, uh, like, you know, basically, right, I mean, sort of\n"
-        "- Remove false starts, stutters, and repeated words\n"
-        "- When the speaker corrects themselves (\"I want A, no B\"), keep only the final version\n"
-        "- Fix grammar and punctuation. Do not over-punctuate\n\n"
-        "FORMATTING:\n"
-        "- If the speaker lists steps or items, format as a numbered or bulleted list\n"
-        "- Use paragraphs for topic changes\n"
-        "- Keep the speaker's natural tone and intent\n\n"
+        "You are a voice transcript editor. Transform speech into polished written text.\n\n"
+        "TASK:\n"
+        "- Remove filler words: um, uh, like, you know, basically, I mean\n"
+        "- Remove stutters and repeated words: 'the the' → 'the'\n"
+        "- Fix grammar and spelling: 'their going' → 'they're going'\n"
+        "- Add proper punctuation and sentence breaks\n"
+        "- Capitalize first letter of sentences\n\n"
         "STRICT RULES:\n"
-        "- Output ONLY the cleaned text\n"
-        "- Never add information the speaker did not say\n"
-        "- Never summarize or shorten — preserve the full meaning\n"
-        "- Never add labels, quotes, or commentary\n"
-        "- If unsure about a word, keep the original"
+        "- Preserve ALL content and meaning - never summarize or remove information\n"
+        "- Keep the speaker's natural tone and voice\n"
+        "- Output ONLY the edited text - no labels, quotes, or explanations"
     ),
 )
 
@@ -1073,7 +1068,7 @@ def clean_and_inject(raw: str, overlay: Overlay):
                 {"role": "user", "content": raw},
             ],
             temperature=0.0,
-            max_tokens=1024,
+            max_tokens=4096,
             stream=True,
         )
 
@@ -1114,6 +1109,12 @@ def inject_text(text: str):
     """
     if not text:
         return
+    # Strip trailing newlines to prevent accidental message submission
+    text = text.rstrip("\n\r\t ")
+    if not text:
+        return
+    # Small delay to ensure target app is ready
+    time.sleep(0.05)
     # Walk through runs of plain text separated by \n / \t
     segment: list[str] = []
     for char in text:
@@ -1121,8 +1122,11 @@ def inject_text(text: str):
             if segment:
                 _kb.type("".join(segment))
                 segment.clear()
+            # Shift+Enter inserts a newline without submitting the message
+            _kb.press(KbKey.shift)
             _kb.press(KbKey.enter)
             _kb.release(KbKey.enter)
+            _kb.release(KbKey.shift)
         elif char == "\t":
             if segment:
                 _kb.type("".join(segment))
@@ -1196,7 +1200,7 @@ def pipeline_worker(overlay: Overlay):
                             {"role": "user", "content": transcript},
                         ],
                         temperature=0.0,
-                        max_tokens=1024,
+                        max_tokens=4096,
                         stream=True,
                     )
                     parts: list[str] = []
