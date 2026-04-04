@@ -553,6 +553,20 @@ class Overlay:
         except tk.TclError:
             pass
 
+        # Windows 11 adds a 1px DWM border around all windows (including
+        # overrideredirect ones). Disable it so no white outline appears.
+        if _IS_WIN:
+            try:
+                DWMWA_BORDER_COLOR = 34
+                DWMWA_COLOR_NONE = 0xFFFFFFFE
+                hwnd = self.root.winfo_id()
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_BORDER_COLOR,
+                    ctypes.byref(ctypes.c_uint(DWMWA_COLOR_NONE)), 4,
+                )
+            except Exception:
+                pass
+
         self._drag_x = self._drag_y = 0
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
