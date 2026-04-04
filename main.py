@@ -524,13 +524,11 @@ class Overlay:
         self.root.title("Custom Flow")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.96)
 
-        # Use the idle border colour as window background so the tiny
-        # canvas corners that fall outside the pill shape are invisible.
-        # No -transparentcolor needed (and avoids Windows crash 0xC0000142).
-        _idle_border = self.PALETTE["idle"][2]
-        self.root.configure(bg=_idle_border)
+        # Chroma-key colour used to punch transparent holes in the corners.
+        # Must not appear anywhere in the pill palette.
+        _KEY = "#010203"
+        self.root.configure(bg=_KEY)
 
         # Position pill using the actual work area
         # (handles taskbar on Windows, menu bar + Dock on macOS).
@@ -541,14 +539,19 @@ class Overlay:
 
         self.canvas = tk.Canvas(
             root, width=self.W, height=self.H,
-            bg=_idle_border, highlightthickness=0, bd=0,
+            bg=_KEY, highlightthickness=0, bd=0,
         )
         self.canvas.pack()
 
-        # Clip the window to a rounded rectangle so the OS-level rectangular
-        # corners are never visible (fixes rendering on recent Windows 11 builds
-        # where overrideredirect + alpha compositing exposes the rect frame).
-        self._apply_region()
+        # Make the key colour transparent so the rectangular corners are
+        # invisible. -alpha is intentionally omitted here: combining
+        # -alpha with -transparentcolor on Windows causes the crash
+        # 0xC0000142; full opacity with a chroma key is cleaner anyway.
+        self.root.update_idletasks()
+        try:
+            self.root.attributes("-transparentcolor", _KEY)
+        except tk.TclError:
+            pass
 
         self._drag_x = self._drag_y = 0
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
@@ -560,26 +563,6 @@ class Overlay:
         self._anim_id: str | None = None
 
         self._render("idle")
-
-    # ── Window region (clip rectangular corners) ──
-
-    def _apply_region(self):
-        """Clip the window to a rounded rectangle so OS rectangular corners
-        are never visible, regardless of Windows compositing mode."""
-        if not _IS_WIN:
-            return
-        try:
-            self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            if not hwnd:
-                hwnd = self.root.winfo_id()
-            rgn = ctypes.windll.gdi32.CreateRoundRectRgn(
-                0, 0, self.W + 1, self.H + 1,
-                self.R * 2, self.R * 2,
-            )
-            ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
-        except Exception:
-            pass
 
     # ── Drag ──
 
